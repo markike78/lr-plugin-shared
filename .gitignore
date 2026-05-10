@@ -1,0 +1,4 @@
+# Track only CLAUDE.md — project subdirectories have their own repos
+*
+!CLAUDE.md
+!.gitignore

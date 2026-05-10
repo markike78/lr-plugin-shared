@@ -70,6 +70,24 @@ Log file locations:
 
 There is no automated test runner. All testing is manual inside a live LR catalog.
 
+## Keyword API quirks
+
+**`kw:getChildren()` returns `nil`, not `{}`** when a keyword has no children. Always guard with `kw:getChildren() or {}`. Same applies to `kw:getSynonyms()`.
+
+**`catalog:createKeyword()` requires its own `withWriteAccessDo`** before the new keyword can be used as a `setParent` target. Creating a keyword and reparenting into it in the same transaction fails — split into two separate write blocks.
+
+**`kw:setAttributes()` is all-or-nothing** — partial updates are not supported. Read the current attributes table, modify the fields you need, then write the whole table back.
+
+**Root keywords have `kw:getParent() == nil`** — there is no special root object. Parentless keywords are the tree roots.
+
+**`kw:getSynonyms()` returns a plain array** — the SDK does not deduplicate or normalize. If you merge synonym lists, deduplicate manually with case-insensitive comparison.
+
+## Dialog and binding quirks
+
+**`LrBinding.negativeOfKey("propName")`** inverts a boolean property for use in `enabled` bindings — useful for disabling a control when a paired checkbox is checked.
+
+**Dynamic dialog rows** use string-indexed properties (`"row_" .. i`) to bind generated controls to a property table. There is no array-binding API; name each property individually.
+
 ## Custom metadata
 
 Declared via `LrMetadataDefinition` in `Info.lua` pointing to a metadata definition file. Fields are plugin-namespaced (e.g. `com.example.myplugin.fieldId`). Boolean `dataType` is unreliable across SDK versions — use `"string"` with a sentinel value (e.g. `"1"`) instead.

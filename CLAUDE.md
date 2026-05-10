@@ -70,6 +70,26 @@ Log file locations:
 
 There is no automated test runner. All testing is manual inside a live LR catalog.
 
+## Thumbnail API quirks
+
+**`photo:requestJpegThumbnail()` is callback-based and requires busy-wait polling.** The callback sets a flag; the caller must loop with `LrTasks.sleep(0.1)` until the flag is set or a timeout is reached. There is no synchronous variant:
+
+```lua
+photo:requestJpegThumbnail(1024, 1024, function(data)
+    jpegData = data
+    done     = true
+end)
+local waited = 0
+while not done and waited < 600 do   -- 60-second timeout
+    LrTasks.sleep(0.1)
+    waited = waited + 1
+end
+```
+
+**The thumbnail renderer times out unpredictably.** Even with a 60-second wait, requests occasionally fail. Wrap in a retry loop (two attempts with a 2-second backoff) as a production safeguard.
+
+**Assigning a child keyword auto-propagates ancestor keywords.** When you call `photo:addKeyword(childKw)`, Lightroom automatically adds all ancestor keywords up the hierarchy. If that is unwanted, explicitly call `photo:removeKeyword(ancestorKw)` afterwards.
+
 ## Keyword API quirks
 
 **`kw:getChildren()` returns `nil`, not `{}`** when a keyword has no children. Always guard with `kw:getChildren() or {}`. Same applies to `kw:getSynonyms()`.
@@ -87,6 +107,90 @@ There is no automated test runner. All testing is manual inside a live LR catalo
 **`LrBinding.negativeOfKey("propName")`** inverts a boolean property for use in `enabled` bindings — useful for disabling a control when a paired checkbox is checked.
 
 **Dynamic dialog rows** use string-indexed properties (`"row_" .. i`) to bind generated controls to a property table. There is no array-binding API; name each property individually.
+
+## HTTP and external APIs
+
+**`LrHttp.post()` signature:**
+```lua
+local response, headers = LrHttp.post(url, body, headersArray, 'POST', timeoutSecs, maxResponseBytes)
+```
+Headers are an array of `{ field = "Name", value = "Value" }` tables. Check `headers.status ~= 200` for HTTP errors; a nil response or nil headers indicates a network failure.
+
+**No built-in JSON module.** Bundle a pure-Lua JSON library (e.g. `JSON.lua`) in the plugin folder and `require` it. The SDK does not provide one.
+
+**Base64 encoding for image upload.** The SDK has no built-in base64 encoder. Bundle a pure-Lua `Base64.lua`. To send an image to an API, get JPEG bytes from `photo:requestJpegThumbnail()`, encode with `Base64.encode(jpegData)`, and wrap as a data URI:
+```lua
+local dataUri = 'data:image/jpeg;base64,' .. Base64.encode(jpegData)
+```
+
+**Concurrency with LrTasks.** Spawn parallel API calls via `LrTasks.startAsyncTask`. Manage a concurrency limit with a shared active-count variable and `LrTasks.sleep(0.1)` polling — there is no built-in semaphore or Promise API.
+
+## fal.ai / OpenRouter integration
+
+Documented from the shuttertag project. Use as a template for any future vision-AI feature.
+
+**Endpoint:** `https://fal.run/openrouter/router/vision`
+
+**Authentication:** fal.ai uses `"Key <apiKey>"` in the Authorization header — not `"Bearer"`:
+```lua
+{ field = 'Authorization', value = 'Key ' .. apiKey }
+```
+
+**Request body:**
+```lua
+JSON.encode({
+    model      = modelId,          -- OpenRouter model string
+    prompt     = promptString,     -- instruct the model to return JSON only
+    image_urls = { dataUri },      -- base64 data URI array
+    max_tokens = 4096,
+})
+```
+
+**Response schema varies by route.** Handle both OpenAI-compatible and fal.ai native formats:
+```lua
+local content
+if parsed.choices and parsed.choices[1] then
+    content = parsed.choices[1].message.content   -- OpenAI format
+elseif parsed.output then
+    content = parsed.output                        -- fal.ai native format
+end
+```
+
+**The model sometimes wraps JSON in markdown fences.** Strip with three fallback patterns:
+```lua
+local jsonStr = content:match('```json%s*(.-)%s*```')
+             or content:match('```%s*(.-)%s*```')
+             or content:match('{.+}')
+```
+
+**Known failure mode — Python-syntax response.** Some routes return a Python dict (`{'key': 'value'}`) instead of JSON. Detect and surface a user-friendly error; retrying usually succeeds:
+```lua
+if jsonStr:match("^%s*{%s*'") then
+    return nil, 'Unexpected response format — reprocessing usually resolves this.'
+end
+```
+
+**Token truncation detection:**
+```lua
+local finish_reason = parsed.choices and parsed.choices[1] and parsed.choices[1].finish_reason
+if finish_reason and finish_reason ~= 'stop' then
+    -- response was cut off — reduce max_tokens or switch model
+end
+```
+
+**Cost extraction.** OpenRouter reports cost inconsistently across response fields — check all locations:
+```lua
+local cost = tonumber(parsed.cost)
+          or (parsed.usage and (tonumber(parsed.usage.cost) or tonumber(parsed.usage.total_cost)))
+```
+
+**Force JSON-only output in your prompt.** Vision models often add prose unless explicitly told not to:
+```
+Analyze this photograph and respond ONLY with a JSON object using exactly these keys: ...
+Do not include any text outside the JSON object.
+```
+
+**Concurrency recommendation from production use:** serialize thumbnail rendering (1 concurrent — LR queues renders internally) and parallelize API calls (8 concurrent — pure network I/O).
 
 ## Custom metadata
 

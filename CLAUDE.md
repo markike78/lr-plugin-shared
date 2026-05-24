@@ -6,13 +6,15 @@ Applies to all Lightroom Classic plugin projects under this directory.
 
 Plugins run in **Lua 5.1** — no `goto`, no `//` integer division, no bitwise operators, and **no `\xNN` hex string escapes** (that is Lua 5.2+). Use literal UTF-8 characters in strings (e.g. `—`, `•`, `→`, `…`) or decimal escapes (e.g. `\226\128\148` for —).
 
-Target SDK: **15.3** (Lightroom Classic, current as of 2026). Minimum SDK declared in each plugin's `Info.lua`.
+Target SDK: **14.0** (latest Lightroom Classic SDK; LR software version is 15.3). Minimum SDK declared in each plugin's `Info.lua`.
 
 ## Critical SDK rules
 
 **Async rule:** Any code that reads from the catalog — including `getRawMetadata` — must run inside `LrTasks.startAsyncTask()`. Entry-point scripts (files listed in `LrLibraryMenuItems`) each start their own async task at the top level.
 
-**Write rule:** All `setRawMetadata`, `addKeyword`, and `removeKeyword` calls must be inside `catalog:withWriteAccessDo("undo label", function() ... end)`. `getRawMetadata` cannot be called inside `withWriteAccessDo` (yielding is not allowed in that context) — pre-read any values you need before entering the write block.
+**Write rule:** All `setRawMetadata`, `addKeyword`, and `removeKeyword` calls must be inside `catalog:withWriteAccessDo("undo label", function() ... end)`. `getRawMetadata` cannot be called inside `withWriteAccessDo` (yielding is not allowed in that context) — pre-read any values you need before entering the write block. Always pass a timeout: `catalog:withWriteAccessDo("label", fn, { timeout = 30 })` — without it, any transient LR background write (auto-save, sync) causes an immediate "blocked by another write access call" error.
+
+**pcall + withWriteAccessDo:** Never wrap `withWriteAccessDo` in standard Lua `pcall`. It interferes with LR's write-transaction mechanism and silently prevents catalog writes from committing — operations appear to succeed but nothing changes in the catalog. Repeated failures can also corrupt LR's internal write-lock state, requiring a Lightroom restart.
 
 **Dialog rule:** `LrBinding.makePropertyTable(context)` requires a function context. Always wrap dialog code in `LrFunctionContext.callWithContext("name", function(context) ... end)`.
 
@@ -25,6 +27,8 @@ Target SDK: **15.3** (Lightroom Classic, current as of 2026). Minimum SDK declar
 **Color label** is read/written via `getRawMetadata("colorNameForLabel")` — returns `"red"`, `"yellow"`, `"green"`, `"blue"`, `"purple"`, or `"none"`. The key `"label"` is not valid for `getRawMetadata`.
 
 **Rating** — `getRawMetadata("rating")` returns `nil` for unrated photos (not `0`). Use `setRawMetadata("rating", nil)` to clear to unrated; `setRawMetadata("rating", 0)` is invalid.
+
+**Capture time** — `dateTimeOriginal` is read-only; `setRawMetadata("dateTimeOriginal", ...)` throws "unknown metadata key". To copy capture time between photos: read with `getRawMetadata("dateTimeOriginalISO8601")` (returns ISO 8601 string; fall back to `"dateTimeDigitizedISO8601"` or `"dateTimeISO8601"`), then write with `setRawMetadata("dateCreated", isoString)`. This updates the catalog only — the file's EXIF is unchanged until the user saves metadata to file.
 
 **Pick/Reject flags** are per-folder or per-collection context and are not portable metadata. Do not sync them between photos.
 
@@ -192,6 +196,79 @@ Do not include any text outside the JSON object.
 
 **Concurrency recommendation from production use:** serialize thumbnail rendering (1 concurrent — LR queues renders internally) and parallelize API calls (8 concurrent — pure network I/O).
 
+## fal.ai Image Editing Endpoints
+
+Documented from the AI-Edit plugin project. Covers the native fal.ai edit model endpoints (not OpenRouter).
+
+**Endpoints:**
+```
+https://fal.run/fal-ai/flux-2-pro/edit
+https://fal.run/fal-ai/flux-2/edit
+https://fal.run/fal-ai/nano-banana-2/edit
+```
+
+**Parameter name is `image_urls` (plural array) — not `image_url` singular.** Sending `image_url` returns 422 Unprocessable Entity.
+
+**Base64 data URIs are accepted** in `image_urls` — confirmed via test. No external image hosting required:
+```lua
+image_urls = { 'data:image/jpeg;base64,' .. Base64.encode(jpegBytes) }
+```
+
+**Response shape** (different from OpenRouter vision route):
+```lua
+-- parsed.images[1].url → temporary fal.media CDN URL (must fetch separately)
+-- parsed.seed          → seed used
+-- No choices/output wrapping
+local resultUrl = parsed.images and parsed.images[1] and parsed.images[1].url
+```
+
+**Result image is a CDN URL, not inline bytes.** Must make a second HTTP GET to download the image before saving.
+
+**CDN retention:** 7 days default. Set short expiration with request header to auto-expire after download:
+```lua
+{ field = 'X-Fal-Object-Lifecycle-Preference', value = '{"expiration_duration_seconds":300}' }
+```
+
+**Force-delete API** — call after downloading to remove immediately:
+```
+DELETE https://api.fal.ai/v1/models/requests/{requestId}/payloads
+Authorization: Key YOUR_API_KEY
+```
+The `requestId` comes from the `x-fal-request-id` response header (not the response body).
+
+**Model pixel limits:** FLUX.2 Pro accepts ≤ 9 MP input (~3000×3000 or 4000×2250). Images must be resized before submission — use `LrExportSession` with `LR_size_maxHeight`/`LR_size_maxWidth` set to target px, not `requestJpegThumbnail`.
+
+**Output resolution ≠ input resolution.** Edit models generate at their own output resolution (controlled by `image_size`/`resolution` params), not the submitted image size. A 4K input does not produce a 4K output.
+
+**Concurrency for image editing:** 2 concurrent max for 2–4K images; 1 for 8K. Edit jobs take 15–60 s each (vs. < 5 s for vision calls). Higher concurrency hits fal.ai queue limits without speed benefit.
+
+**Downloading the result image** — use `LrHttp.post()` with `'GET'` method (LrHttp.get() signature is unreliable for large payloads):
+```lua
+local data, hdrs = LrHttp.post(resultUrl, '', {}, 'GET', 120, 25 * 1024 * 1024)
+```
+
 ## Custom metadata
 
-Declared via `LrMetadataDefinition` in `Info.lua` pointing to a metadata definition file. Fields are plugin-namespaced (e.g. `com.example.myplugin.fieldId`). Boolean `dataType` is unreliable across SDK versions — use `"string"` with a sentinel value (e.g. `"1"`) instead.
+Declared via **`LrMetadataProvider`** in `Info.lua` pointing to a metadata definition file (not `LrMetadataDefinitionFile` — that key is silently ignored and the schema will never register):
+```lua
+LrMetadataProvider = 'MyMetadata.lua',
+```
+
+The definition file returns a table with `schemaVersion` (integer) and `metadataFieldsForPhotos`. Each field uses `title` (not `label`) for the display name. Supported `dataType` values: `"string"`, `"enum"`, `"URL"` only.
+
+**Changing any field property requires two version bumps:** increment the top-level `schemaVersion` AND add/increment a `version` key on the specific field that changed. Missing the field-level `version` causes a "could not upgrade catalog" error when re-adding the plugin:
+```lua
+{ id = 'myField', dataType = 'string', searchable = false, version = 2 }
+```
+
+**Searchable string fields are capped at 512 bytes.** Non-searchable fields have no size limit. Use `searchable = false` for any field that may hold long text (prompts, descriptions).
+
+**Read/write custom metadata with `setPropertyForPlugin` / `getPropertyForPlugin`**, not `setRawMetadata`. The first argument must be `_PLUGIN` (the global LrPlugin object LR injects automatically), not a string identifier:
+```lua
+photo:setPropertyForPlugin(_PLUGIN, 'fieldId', value)        -- correct
+photo:setPropertyForPlugin('com.example.myplugin', 'fieldId', value)  -- wrong, silently fails
+photo:setRawMetadata('fieldId', value)   -- wrong, unknown metadata key error
+```
+Both calls must be inside `catalog:withWriteAccessDo`.
+
+Boolean `dataType` is unreliable across SDK versions — use `"string"` with a sentinel value (e.g. `"1"`) instead.
